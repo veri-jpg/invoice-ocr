@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+service-account*.json
+results/*.json
+!results/.gitkeep
+processed/*.txt
+processed/*.jsonl
+!processed/.gitkeep
+logs/
