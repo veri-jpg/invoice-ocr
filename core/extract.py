@@ -154,6 +154,17 @@ def _call_gemini(image_bytes: bytes, media_type: str) -> str:
             ],
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
+
+        # Diagnostik: kalau respons kepotong/rusak, ini yang jawab PASTI kenapa
+        # (MAX_TOKENS, SAFETY, dll) — bukan nebak dari pola teks doang.
+        finish_reason = response.candidates[0].finish_reason if response.candidates else None
+        if finish_reason is not None and finish_reason != types.FinishReason.STOP:
+            logger.warning(
+                "Gemini finish_reason=%s (bukan STOP), usage_metadata=%s",
+                finish_reason,
+                response.usage_metadata,
+            )
+
         return response.text or ""
     except genai_errors.APIError as e:
         if e.code in RETRYABLE_STATUS_CODES:
