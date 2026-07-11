@@ -1,9 +1,13 @@
 import base64
 import json
+import logging
 import os
+import re
 import time
 
 import anthropic
+
+logger = logging.getLogger(__name__)
 
 # Nama model bisa di-override lewat env var ANTHROPIC_MODEL / GEMINI_MODEL (lihat .env.example)
 # tanpa perlu edit kode. Dibaca saat runtime (bukan konstanta di sini) karena load_dotenv()
@@ -13,7 +17,7 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 
 MAX_RETRYABLE_ATTEMPTS = 4  # 1 percobaan awal + 3 retry
 BACKOFF_BASE_SECONDS = 1.0
-JSON_RETRY_ATTEMPTS = 2  # total percobaan kalau respons gagal di-parse sebagai JSON
+JSON_RETRY_ATTEMPTS = 3  # total percobaan kalau respons gagal di-parse sebagai JSON
 
 # Status code yang aman untuk di-retry: rate limit (429) dan server overload
 # (529 di Anthropic, 503 "UNAVAILABLE" di Gemini).
@@ -38,7 +42,9 @@ Field yang diambil:
 
 Aturan:
 - Jika field tidak ditemukan atau tidak terbaca jelas, isi null. JANGAN menebak.
-- Angka dalam Rupiah: "15.400.000" berarti 15400000
+- Angka dalam Rupiah: "15.400.000" berarti 15400000. Field dpp/ppn/total HARUS berupa
+  angka JSON yang valid (contoh: 15400000) — JANGAN PERNAH menyertakan titik atau koma
+  sebagai pemisah ribuan dalam angka JSON, itu membuat JSON tidak valid.
 - Jangan tertukar antara tanggal invoice dan tanggal jatuh tempo
 """
 
@@ -61,6 +67,41 @@ def _strip_markdown_fences(text: str) -> str:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
     return text
+
+
+# Model kadang lupa instruksi prompt dan nulis dpp/ppn/total Rupiah dengan titik
+# pemisah ribuan asli (mis. "total": 15.400.000), yang bikin JSON invalid (dua
+# titik dalam satu angka). Beda dari desimal asli (mis. 1169318.58, cuma 1 titik),
+# jadi aman ditarget spesifik ke 3 field numerik ini saja.
+_THOUSANDS_SEPARATOR_RE = re.compile(
+    r'("(?:dpp|ppn|total)"\s*:\s*)(\d{1,3}(?:\.\d{3}){2,})(?=\s*[,}\]])'
+)
+
+
+def _repair_thousands_separators(text: str) -> str:
+    return _THOUSANDS_SEPARATOR_RE.sub(lambda m: m.group(1) + m.group(2).replace(".", ""), text)
+
+
+def _best_effort_parse(text: str) -> dict:
+    """Vision LLM kadang keluarin JSON yang hampir bener tapi ada glitch kecil.
+    Dua yang pernah kejadian: (1) dpp/ppn/total pakai titik ribuan asli, (2) ada
+    kurung/teks nyisa setelah objek JSON yang sebenarnya sudah lengkap & valid.
+    Coba beberapa cara parse berurutan sebelum benar-benar nyerah (masih 1 respons
+    API yang sama, bukan panggilan API baru)."""
+    last_error: json.JSONDecodeError | None = None
+    for candidate in (text, _repair_thousands_separators(text)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            last_error = e
+        try:
+            # raw_decode ambil objek JSON valid pertama, abaikan sisa teks
+            # di belakangnya (kasus "Extra data" kalau model dobel penutup).
+            obj, _end_pos = json.JSONDecoder().raw_decode(candidate.strip())
+            return obj
+        except json.JSONDecodeError as e:
+            last_error = e
+    raise last_error
 
 
 def _call_anthropic(image_bytes: bytes, media_type: str) -> str:
@@ -148,10 +189,11 @@ def extract_invoice(image_bytes: bytes, media_type: str) -> dict:
         json_attempts += 1
         cleaned = _strip_markdown_fences(raw_text)
         try:
-            return json.loads(cleaned)
+            return _best_effort_parse(cleaned)
         except json.JSONDecodeError as e:
             last_json_error = e
             if json_attempts >= JSON_RETRY_ATTEMPTS:
+                logger.warning("Respons API gagal di-parse sebagai JSON, raw text: %s", raw_text[:1000])
                 raise ValueError(
                     f"Gagal parsing JSON dari respons API setelah {json_attempts} percobaan: {last_json_error}"
                 )
