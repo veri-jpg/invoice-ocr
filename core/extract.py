@@ -82,12 +82,48 @@ def _repair_thousands_separators(text: str) -> str:
     return _THOUSANDS_SEPARATOR_RE.sub(lambda m: m.group(1) + m.group(2).replace(".", ""), text)
 
 
+def _repair_truncated_json(text: str) -> str:
+    """Gemini kadang berhenti generate persis sebelum nutup JSON-nya (finish_reason
+    tetap STOP, bukan MAX_TOKENS -- terverifikasi lewat reproduksi manual, bukan
+    dugaan). Hitung kurung/kurawal yang belum ke-close (abaikan yang di dalam
+    string literal) dan tutup di akhir. Kalau teksnya berhenti pas di tengah
+    koma penutup, buang komanya dulu supaya nggak jadi trailing comma invalid."""
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+
+    if not stack:
+        return text
+
+    trimmed = text.rstrip()
+    if trimmed.endswith(","):
+        trimmed = trimmed[:-1]
+    return trimmed + "".join(reversed(stack))
+
+
 def _best_effort_parse(text: str) -> dict:
     """Vision LLM kadang keluarin JSON yang hampir bener tapi ada glitch kecil.
-    Dua yang pernah kejadian: (1) dpp/ppn/total pakai titik ribuan asli, (2) ada
-    kurung/teks nyisa setelah objek JSON yang sebenarnya sudah lengkap & valid.
-    Coba beberapa cara parse berurutan sebelum benar-benar nyerah (masih 1 respons
-    API yang sama, bukan panggilan API baru)."""
+    Tiga yang pernah kejadian nyata: (1) dpp/ppn/total pakai titik ribuan asli,
+    (2) ada kurung/teks nyisa setelah objek JSON yang sebenarnya sudah lengkap,
+    (3) generate berhenti persis sebelum nutup kurung JSON-nya. Coba beberapa
+    cara parse berurutan sebelum benar-benar nyerah (masih 1 respons API yang
+    sama, bukan panggilan API baru)."""
     last_error: json.JSONDecodeError | None = None
     for candidate in (text, _repair_thousands_separators(text)):
         try:
@@ -99,6 +135,10 @@ def _best_effort_parse(text: str) -> dict:
             # di belakangnya (kasus "Extra data" kalau model dobel penutup).
             obj, _end_pos = json.JSONDecoder().raw_decode(candidate.strip())
             return obj
+        except json.JSONDecodeError as e:
+            last_error = e
+        try:
+            return json.loads(_repair_truncated_json(candidate))
         except json.JSONDecodeError as e:
             last_error = e
     raise last_error
